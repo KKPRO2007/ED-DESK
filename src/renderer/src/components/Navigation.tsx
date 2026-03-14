@@ -16,12 +16,6 @@ export default function Navigation() {
         <Link to="/" className={`nav-link ${isActive('/')}`}>
           Home
         </Link>
-        <Link to="/create-session" className={`nav-link ${isActive('/create-session')}`}>
-          Create Session
-        </Link>
-        <Link to="/chat" className={`nav-link ${isActive('/chat')}`}>
-          Chat
-        </Link>
         <Link to="/assessment" className={`nav-link ${isActive('/assessment')}`}>
           Assessment
         </Link>
@@ -35,9 +29,10 @@ export default function Navigation() {
           Discussion
         </Link>
       </div>
-      <button className="btn btn-secondary" style={{ padding: '0.5rem 1rem' }}>
-        Demo Mode
-      </button>
+      <div className="nav-status">
+        <span className="status-indicator online"></span>
+        <span className="status-text">System Online</span>
+      </div>
     </nav>
   )
 }
