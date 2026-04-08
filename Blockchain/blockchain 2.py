@@ -6,6 +6,22 @@ from flask import Flask, request, jsonify
 import requests
 
 class Blockchain:
+    \
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
 
     def __init__(self):
         self.chain = []
