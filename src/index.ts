@@ -17,6 +17,21 @@ let previousProcessSnapshot = new Map<number, { cpuSeconds: number; sampledAt: n
 let batteryHistory: number[] = []
 let windowsInfoCache: WindowsInfoRow | null = null
 
+async function ensureBackendService(): Promise<OfflineBackendService> {
+  if (backendService) return backendService
+
+  const service = new OfflineBackendService()
+  try {
+    await service.start()
+    backendService = service
+    return service
+  } catch (error) {
+    console.error('Offline backend failed to start:', error)
+    backendService = null
+    throw error
+  }
+}
+
 interface PowerShellProcessRow {
   Id: number
   ProcessName: string
@@ -394,10 +409,8 @@ app.whenReady().then(async () => {
   createWindow()
 
   try {
-    backendService = new OfflineBackendService()
-    await backendService.start()
+    await ensureBackendService()
   } catch (error) {
-    console.error('Offline backend failed to start:', error)
     backendService = null
   }
 
@@ -543,46 +556,41 @@ app.whenReady().then(async () => {
 
   // ==================== OFFLINE BACKEND HANDLERS ====================
 
-  ipcMain.handle('offline:get-status', () => backendService?.getStatus() ?? null)
-  ipcMain.handle('offline:get-profile', () => backendService?.getProfile() ?? null)
-  ipcMain.handle('offline:get-permissions', () => backendService?.getPermissions())
-  ipcMain.handle('offline:update-permissions', (_event, payload) => backendService?.updatePermissions(payload))
-  ipcMain.handle('offline:scan-peers', () => backendService?.scanPeers() ?? [])
-  ipcMain.handle('offline:list-peers', () => backendService?.listPeers() ?? [])
-  ipcMain.handle('offline:list-sessions', () => backendService?.listAvailableSessions() ?? [])
-  ipcMain.handle('offline:get-hosted-session', () => backendService?.getHostedSession() ?? null)
-  ipcMain.handle('offline:create-hosted-session', (_event, payload) => {
-    if (!backendService) throw new Error('Offline backend is not running.')
-    return backendService.createHostedSession(payload)
+  ipcMain.handle('offline:get-status', async () => (await ensureBackendService()).getStatus())
+  ipcMain.handle('offline:get-profile', async () => (await ensureBackendService()).getProfile())
+  ipcMain.handle('offline:get-permissions', async () => (await ensureBackendService()).getPermissions())
+  ipcMain.handle('offline:update-permissions', async (_event, payload) => (await ensureBackendService()).updatePermissions(payload))
+  ipcMain.handle('offline:scan-peers', async () => (await ensureBackendService()).scanPeers())
+  ipcMain.handle('offline:list-peers', async () => (await ensureBackendService()).listPeers())
+  ipcMain.handle('offline:list-sessions', async () => (await ensureBackendService()).listAvailableSessions())
+  ipcMain.handle('offline:get-hosted-session', async () => (await ensureBackendService()).getHostedSession())
+  ipcMain.handle('offline:create-hosted-session', async (_event, payload) => {
+    return (await ensureBackendService()).createHostedSession(payload)
   })
-  ipcMain.handle('offline:close-hosted-session', () => {
-    backendService?.closeHostedSession()
+  ipcMain.handle('offline:close-hosted-session', async () => {
+    ;(await ensureBackendService()).closeHostedSession()
   })
   ipcMain.handle('offline:join-session', async (_event, code: string, password?: string) => {
-    if (!backendService) throw new Error('Offline backend is not running.')
-    return await backendService.joinSessionByCode(code, password)
+    return await (await ensureBackendService()).joinSessionByCode(code, password)
   })
-  ipcMain.handle('offline:list-conversations', () => backendService?.listConversations() ?? [])
-  ipcMain.handle('offline:get-messages', (_event, conversationId: string) => {
-    return backendService?.getMessages(conversationId) ?? []
+  ipcMain.handle('offline:list-conversations', async () => (await ensureBackendService()).listConversations())
+  ipcMain.handle('offline:get-messages', async (_event, conversationId: string) => {
+    return (await ensureBackendService()).getMessages(conversationId)
   })
   ipcMain.handle('offline:send-message', async (_event, peerId: string, content: string, sessionCode?: string) => {
-    if (!backendService) throw new Error('Offline backend is not running.')
-    return await backendService.sendLanMessage(peerId, content, sessionCode)
+    return await (await ensureBackendService()).sendLanMessage(peerId, content, sessionCode)
   })
-  ipcMain.handle('offline:list-assessments', () => backendService?.listAssessments() ?? [])
+  ipcMain.handle('offline:list-assessments', async () => (await ensureBackendService()).listAssessments())
   ipcMain.handle('offline:create-assessment', async (_event, payload) => {
-    if (!backendService) throw new Error('Offline backend is not running.')
-    return await backendService.createAssessment(payload)
+    return await (await ensureBackendService()).createAssessment(payload)
   })
   ipcMain.handle('offline:submit-assessment', async (_event, payload) => {
-    if (!backendService) throw new Error('Offline backend is not running.')
-    return await backendService.submitAssessment(payload)
+    return await (await ensureBackendService()).submitAssessment(payload)
   })
-  ipcMain.handle('offline:list-submissions', (_event, assessmentId: string) => {
-    return backendService?.listSubmissions(assessmentId) ?? []
+  ipcMain.handle('offline:list-submissions', async (_event, assessmentId: string) => {
+    return (await ensureBackendService()).listSubmissions(assessmentId)
   })
-  ipcMain.handle('offline:list-ledger', () => backendService?.listLedger() ?? [])
+  ipcMain.handle('offline:list-ledger', async () => (await ensureBackendService()).listLedger())
 })
 
 app.on('window-all-closed', () => {

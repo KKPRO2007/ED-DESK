@@ -59,7 +59,7 @@ export class OfflineBackendService {
   private peerExpiryTimer: NodeJS.Timeout | null = null
 
   constructor() {
-    this.database = new BackendDatabase(join(app.getPath('userData'), 'backend', 'eddesk.json'))
+    this.database = new BackendDatabase(join(app.getPath('userData'), 'backend', 'eddesk.sqlite'))
     this.peerId = `peer-${os.hostname().toLowerCase()}`
     this.displayName = os.hostname()
   }
@@ -201,10 +201,12 @@ export class OfflineBackendService {
 
     for (const peer of peers) {
       const status: PeerRecord['status'] = now - peer.lastSeen > 30000 ? 'stale' : 'online'
-      if (status !== peer.status) {
+      const hostedSession = status === 'stale' ? null : peer.hostedSession
+      if (status !== peer.status || hostedSession !== peer.hostedSession) {
         this.database.upsertPeer({
           ...peer,
-          status
+          status,
+          hostedSession
         })
       }
     }
@@ -373,7 +375,7 @@ export class OfflineBackendService {
 
   listAvailableSessions(): Array<SessionRecord & { address: string; peerStatus: PeerRecord['status'] }> {
     return this.listPeers()
-      .filter((peer) => peer.hostedSession)
+      .filter((peer) => peer.status === 'online' && peer.hostedSession)
       .map((peer) => ({
         id: `remote-${peer.id}`,
         code: peer.hostedSession!.code,
@@ -452,23 +454,42 @@ export class OfflineBackendService {
 
   async joinSessionByCode(code: string, password?: string): Promise<SessionRecord> {
     const normalizedCode = code.trim().toUpperCase()
-    const directMatch = this.listPeers().find((peer) => peer.hostedSession?.code === normalizedCode)
+    const findLivePeer = () => this.listPeers().find((peer) => peer.status === 'online' && peer.hostedSession?.code === normalizedCode)
+    const stalePeer = this.listPeers().find((peer) => peer.hostedSession?.code === normalizedCode)
+    const directMatch = findLivePeer()
     const peer = directMatch ?? (() => {
       this.broadcastHeartbeat()
-      return this.listPeers().find((candidate) => candidate.hostedSession?.code === normalizedCode)
+      return findLivePeer()
     })()
 
     if (!peer || !peer.hostedSession) {
+      if (stalePeer) {
+        throw new Error(`Session code ${normalizedCode} is no longer active on this network.`)
+      }
       throw new Error(`Session code ${normalizedCode} was not found on this network.`)
     }
 
-    const response = await this.postJson<{ ok: true; session: SessionRecord }>(peer, '/api/peer/session/join', {
-      peerId: this.peerId,
-      peerName: this.displayName,
-      code: normalizedCode,
-      serverPort: this.serverPort,
-      password
-    } satisfies JoinSessionPayload)
+    let response: { ok: true; session: SessionRecord }
+    try {
+      response = await this.postJson<{ ok: true; session: SessionRecord }>(peer, '/api/peer/session/join', {
+        peerId: this.peerId,
+        peerName: this.displayName,
+        code: normalizedCode,
+        serverPort: this.serverPort,
+        password
+      } satisfies JoinSessionPayload)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (/ETIMEDOUT|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH/i.test(message)) {
+        this.database.upsertPeer({
+          ...peer,
+          status: 'stale',
+          hostedSession: null
+        })
+        throw new Error(`Session code ${normalizedCode} is offline or unreachable right now.`)
+      }
+      throw error
+    }
 
     this.database.ensureConversation(peer.id, peer.displayName, normalizedCode)
     this.database.addLedgerRecord({

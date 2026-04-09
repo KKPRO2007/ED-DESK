@@ -23,12 +23,14 @@ interface Message {
   encrypted?: boolean
   delivered?: boolean
   read?: boolean
+  failed?: boolean
 }
 
 interface Session {
   code: string
   peerId: string
   name: string
+  peerDisplayName: string
   mode: 'host' | 'peer'
   participants: number
   encrypted: boolean
@@ -80,7 +82,8 @@ const buildPeerSession = (
 ): Session => ({
   code: conv?.sessionCode ?? peer.hostedSession?.code ?? peer.id.slice(-6).toUpperCase(),
   peerId: peer.id,
-  name: `Chat · ${peer.displayName}`,
+  name: peer.hostedSession?.name?.trim() || `Chat with ${peer.displayName}`,
+  peerDisplayName: peer.displayName,
   mode: 'peer',
   participants: 2,
   encrypted: peer.hostedSession?.visibility === 'private',
@@ -123,6 +126,8 @@ const findBestConversationForSession = (
 
   return peerConversations.find((item) => item.sessionCode) ?? peerConversations[0]
 }
+
+const isPeerSessionVisible = (peer: PeerRecord) => peer.status === 'online' && Boolean(peer.hostedSession)
 
 const saveActiveSession = (session: Session | null) => {
   if (typeof window === 'undefined') return
@@ -169,6 +174,7 @@ const buildHostSession = (
   code: backendSession.code,
   peerId: profile?.peerId ?? 'local-host',
   name: backendSession.name,
+  peerDisplayName: profile?.displayName ?? 'You',
   mode: 'host',
   participants: 1 + backendSession.participantPeerIds.length,
   encrypted: backendSession.visibility === 'private',
@@ -231,10 +237,13 @@ export default function Chat() {
   const [permPrompt, setPermPrompt] = useState(false)
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const messagesContainerRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const currentSessionRef = useRef<Session | null>(null)
   const isPollingRef = useRef(false)
   const latestMessageSignatureRef = useRef('')
+  const shouldStickToBottomRef = useRef(true)
+  const scanAfterPermissionGrantRef = useRef(false)
   currentSessionRef.current = currentSession
 
   // --- Clock ---
@@ -245,8 +254,16 @@ export default function Chat() {
 
   // --- Scroll to bottom ---
   useEffect(() => {
+    if (!shouldStickToBottomRef.current) return
     messagesEndRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' })
   }, [messages])
+
+  const handleMessagesScroll = useCallback(() => {
+    const container = messagesContainerRef.current
+    if (!container) return
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight
+    shouldStickToBottomRef.current = distanceFromBottom < 96
+  }, [])
 
   // --- Helpers ---
   const fmt = (d: Date) =>
@@ -306,14 +323,16 @@ export default function Chat() {
       ])
 
       const sessions = peers
-        .filter(p => p.hostedSession)
+        .filter(isPeerSessionVisible)
         .map(p => buildPeerSession(
           p,
           findBestConversationForSession(convs, p.id, p.hostedSession?.code),
           profileData?.displayName ?? 'You'
         ))
 
-      const allSessions = peers.map(p =>
+      const allSessions = peers
+        .filter(isPeerSessionVisible)
+        .map(p =>
         buildPeerSession(
           p,
           findBestConversationForSession(convs, p.id, p.hostedSession?.code),
@@ -352,14 +371,39 @@ export default function Chat() {
   // --- Grant permission ---
   const grantPermission = useCallback(async () => {
     try {
-      await offlineApi.updatePermissions({ nearbyScan: 'granted' })
-      setPermissions(prev => prev ? { ...prev, nearbyScan: 'granted' } : { nearbyScan: 'granted', localNetwork: 'granted' })
+      const updated = await offlineApi.updatePermissions({ nearbyScan: 'granted' })
+      setPermissions(updated)
       setPermPrompt(false)
       addLog('Nearby scan permission granted')
+      if (scanAfterPermissionGrantRef.current) {
+        scanAfterPermissionGrantRef.current = false
+        setIsScanning(true)
+        addLog('Scanning LAN for peers...')
+        try {
+          const snap = await loadSnapshot(true)
+          if (!snap) return
+          const sessions = snap.peers
+            .filter(isPeerSessionVisible)
+            .map(p => buildPeerSession(
+              p,
+              findBestConversationForSession(snap.convs, p.id, p.hostedSession?.code),
+              snap.profile?.displayName ?? 'You'
+            ))
+          setNearbySessions(sessions)
+          setShowJoinModal(true)
+          addLog(sessions.length > 0
+            ? `Found ${sessions.length} active session${sessions.length === 1 ? '' : 's'} on LAN`
+            : 'No sessions found. Ask your friend to create a session first.')
+        } catch (e) {
+          showError(`Scan failed: ${getErrorMessage(e)}`)
+        } finally {
+          setIsScanning(false)
+        }
+      }
     } catch (e) {
       showError(`Permission update failed: ${getErrorMessage(e)}`)
     }
-  }, [addLog, showError])
+  }, [addLog, loadSnapshot, showError])
 
   // --- Load messages for current session ---
   const loadMessages = useCallback(async (session: Session, status: BackendStatus | null, prof: { peerId: string; displayName: string } | null) => {
@@ -411,14 +455,15 @@ export default function Chat() {
       const records = await offlineApi.getMessages(session.conversationId)
       const mapped: Message[] = records.map(r => ({
         id: r.id,
-        sender: r.direction === 'outgoing' ? (prof?.displayName ?? 'You') : r.peerName,
-        role: inferRole(r.direction === 'outgoing' ? (prof?.displayName ?? '') : r.peerName),
+        sender: r.direction === 'outgoing' ? (prof?.displayName ?? 'You') : (r.senderName || r.peerName),
+        role: inferRole(r.direction === 'outgoing' ? (prof?.displayName ?? '') : (r.senderName || r.peerName)),
         content: r.content,
         timestamp: new Date(r.createdAt),
         isOwn: r.direction === 'outgoing',
         encrypted: true,
-        delivered: r.status !== 'pending',
-        read: r.status === 'delivered'
+        delivered: r.status === 'delivered',
+        read: r.status === 'delivered',
+        failed: r.status === 'failed'
       }))
 
       syncMessages([systemMsg, ...mapped])
@@ -435,14 +480,15 @@ export default function Chat() {
     prof: { peerId: string; displayName: string } | null
   ): Message[] => records.map(r => ({
     id: r.id,
-    sender: r.direction === 'outgoing' ? (prof?.displayName ?? 'You') : r.peerName,
-    role: inferRole(r.direction === 'outgoing' ? (prof?.displayName ?? '') : r.peerName),
+    sender: r.direction === 'outgoing' ? (prof?.displayName ?? 'You') : (r.senderName || r.peerName),
+    role: inferRole(r.direction === 'outgoing' ? (prof?.displayName ?? '') : (r.senderName || r.peerName)),
     content: r.content,
     timestamp: new Date(r.createdAt),
     isOwn: r.direction === 'outgoing',
     encrypted: true,
-    delivered: r.status !== 'pending',
-    read: r.status === 'delivered'
+    delivered: r.status === 'delivered',
+    read: r.status === 'delivered',
+    failed: r.status === 'failed'
   })), [])
 
   const refreshCurrentSession = useCallback(async (session: Session) => {
@@ -472,7 +518,7 @@ export default function Chat() {
         {
           id: snap.profile?.peerId ?? 'local',
           name: snap.profile?.displayName ?? 'You',
-          role: 'student',
+          role: inferRole(snap.profile?.displayName ?? 'You'),
           status: 'online',
           joinedAt: updatedSession.created,
           device: 'This Device',
@@ -528,6 +574,8 @@ export default function Chat() {
     const conversationId = findBestConversationForSession(snap.convs, session.peerId, session.code)?.id ?? session.conversationId
     const updatedSession: Session = {
       ...session,
+      name: currentPeer?.hostedSession?.name?.trim() || session.name,
+      peerDisplayName: currentPeer?.displayName ?? session.peerDisplayName,
       status: sessionStatus,
       conversationId
     }
@@ -536,7 +584,7 @@ export default function Chat() {
       {
         id: snap.profile?.peerId ?? 'local',
         name: snap.profile?.displayName ?? 'You',
-        role: 'student',
+        role: inferRole(snap.profile?.displayName ?? 'You'),
         status: 'online',
         joinedAt: new Date(),
         device: 'This Device',
@@ -545,11 +593,11 @@ export default function Chat() {
       },
       {
         id: session.peerId,
-        name: currentPeer?.displayName ?? session.name.replace(/^Chat · /, ''),
-        role: inferRole(currentPeer?.displayName ?? session.name),
+        name: currentPeer?.displayName ?? session.peerDisplayName,
+        role: inferRole(currentPeer?.displayName ?? session.peerDisplayName),
         status: sessionStatus === 'online' ? 'online' : 'away',
         joinedAt: session.created,
-        device: currentPeer?.displayName ?? session.name.replace(/^Chat · /, ''),
+        device: currentPeer?.displayName ?? session.peerDisplayName,
         ipAddress: currentPeer?.address ?? session.address,
         messagesSent: 0
       }
@@ -600,7 +648,7 @@ export default function Chat() {
         {
           id: prof?.peerId ?? 'local',
           name: prof?.displayName ?? 'You',
-          role: 'student',
+          role: inferRole(prof?.displayName ?? 'You'),
           status: 'online',
           joinedAt: new Date(),
           device: 'This Device',
@@ -609,11 +657,11 @@ export default function Chat() {
         },
         {
           id: session.peerId,
-          name: session.name.replace(/^Chat · /, ''),
-          role: inferRole(session.name),
+          name: session.peerDisplayName,
+          role: inferRole(session.peerDisplayName),
           status: session.status === 'online' ? 'online' : 'away',
           joinedAt: session.created,
-          device: session.name.replace(/^Chat · /, ''),
+          device: session.peerDisplayName,
           ipAddress: session.address,
           messagesSent: 0
         }
@@ -624,7 +672,7 @@ export default function Chat() {
         {
           id: prof?.peerId ?? 'local',
           name: prof?.displayName ?? 'You',
-          role: 'student',
+          role: inferRole(prof?.displayName ?? 'You'),
           status: 'online',
           joinedAt: new Date(),
           device: 'This Device',
@@ -703,6 +751,7 @@ export default function Chat() {
   // --- Poll for new messages ---
   useEffect(() => {
     if (!currentSession) return
+    shouldStickToBottomRef.current = true
     const interval = setInterval(async () => {
       if (isPollingRef.current) return
       isPollingRef.current = true
@@ -717,7 +766,7 @@ export default function Chat() {
       } finally {
         isPollingRef.current = false
       }
-    }, 1000)
+    }, 1500)
     return () => clearInterval(interval)
   }, [currentSession, refreshCurrentSession])
 
@@ -725,6 +774,8 @@ export default function Chat() {
   const scanForSessions = useCallback(async () => {
     const perms = await offlineApi.getPermissions().catch(() => null)
     if (perms?.nearbyScan !== 'granted') {
+      setPermissions(perms ?? null)
+      scanAfterPermissionGrantRef.current = true
       setPermPrompt(true)
       return
     }
@@ -735,7 +786,7 @@ export default function Chat() {
       const snap = await loadSnapshot(true)
       if (!snap) return
       const sessions = snap.peers
-        .filter(p => p.hostedSession)
+        .filter(isPeerSessionVisible)
         .map(p => buildPeerSession(
           p,
           findBestConversationForSession(snap.convs, p.id, p.hostedSession?.code),
@@ -795,7 +846,7 @@ export default function Chat() {
         {
           id: snap?.profile?.peerId ?? 'local',
           name: snap?.profile?.displayName ?? 'You',
-          role: 'student',
+          role: inferRole(snap?.profile?.displayName ?? 'You'),
           status: 'online',
           joinedAt: new Date(),
           device: 'This Device',
@@ -845,7 +896,8 @@ export default function Chat() {
         const minimalSession: Session = {
           code: normalizedCode,
           peerId: backendSession.hostPeerId,
-          name: `Chat · ${backendSession.hostDisplayName}`,
+          name: backendSession.name,
+          peerDisplayName: backendSession.hostDisplayName,
           mode: 'peer',
           participants: 2,
           encrypted: backendSession.visibility === 'private',
@@ -922,12 +974,13 @@ export default function Chat() {
         setMessages(prev => [...prev, {
           id: `local-${Date.now()}`,
           sender: snap?.profile?.displayName ?? 'You',
-          role: 'student',
+          role: inferRole(snap?.profile?.displayName ?? 'You'),
           content,
           timestamp: new Date(),
           isOwn: true,
           encrypted: true,
-          delivered: true
+          delivered: true,
+          failed: false
         }])
       } catch (e) {
         showError(`Send failed: ${getErrorMessage(e)}`)
@@ -947,12 +1000,13 @@ export default function Chat() {
     setMessages(prev => [...prev, {
       id: optimisticId,
       sender: profile?.displayName ?? 'You',
-      role: 'student',
+      role: inferRole(profile?.displayName ?? 'You'),
       content,
       timestamp: new Date(),
       isOwn: true,
       encrypted: true,
-      delivered: false
+      delivered: false,
+      failed: false
     }])
 
     try {
@@ -961,12 +1015,12 @@ export default function Chat() {
         addLog(`Broadcast sent`)
       } else {
         await offlineApi.sendMessage(currentSession.peerId, content, currentSession.code)
-        addLog(`Message sent to ${currentSession.name.replace(/^Chat · /, '')}`)
+        addLog(`Message sent to ${currentSession.peerDisplayName}`)
       }
-      setMessages(prev => prev.map(m => m.id === optimisticId ? { ...m, delivered: true } : m))
+      setMessages(prev => prev.map(m => m.id === optimisticId ? { ...m, delivered: true, failed: false } : m))
     } catch (e) {
       showError(`Send failed: ${getErrorMessage(e)}`)
-      setMessages(prev => prev.map(m => m.id === optimisticId ? { ...m, delivered: false } : m))
+      setMessages(prev => prev.map(m => m.id === optimisticId ? { ...m, delivered: false, failed: true } : m))
     } finally {
       await refreshCurrentSession(currentSession).catch(() => undefined)
       setIsSending(false)
@@ -1175,6 +1229,7 @@ export default function Chat() {
                 <div className="ch-title">{currentSession.name}</div>
                 <div className="ch-meta">
                   <span className="ch-tag">{currentSession.code}</span>
+                  {currentSession.mode === 'peer' && <span>Chatting with {currentSession.peerDisplayName}</span>}
                   <span>{participants.filter(p => p.status === 'online').length} online / {participants.length} total</span>
                   {currentSession.encrypted && <span className="ch-enc">SECURE</span>}
                   {broadcastMode && <span className="ch-bcast">BROADCAST</span>}
@@ -1207,7 +1262,7 @@ export default function Chat() {
             </div>
 
             {selectedTab === 'messages' && (
-              <div className="msgs">
+              <div className="msgs" ref={messagesContainerRef} onScroll={handleMessagesScroll}>
                 {filteredMessages.map(msg => (
                   <div key={msg.id} className={`mw ${msg.isOwn ? 'mw-own' : ''} ${msg.system ? 'mw-sys' : ''}`}>
                     {msg.system ? (
@@ -1230,7 +1285,7 @@ export default function Chat() {
                           <div className="msg-foot">
                             <span className="msg-ts">{fmt(msg.timestamp)}</span>
                             {msg.isOwn && (
-                              <span className="msg-st">{msg.delivered ? 'SENT' : 'PEND'}</span>
+                              <span className="msg-st">{msg.failed ? 'FAILED' : msg.delivered ? 'SENT' : 'PEND'}</span>
                             )}
                           </div>
                         </div>
@@ -1315,7 +1370,11 @@ export default function Chat() {
                     placeholder={
                       currentSession.mode === 'host' && participants.length <= 1
                         ? `Waiting for friend to join (code: ${currentSession.code})...`
-                        : broadcastMode ? 'Broadcast message...' : 'Type a message... (Enter to send)'
+                        : broadcastMode
+                          ? 'Broadcast message...'
+                          : currentSession.mode === 'peer'
+                            ? `Message ${currentSession.peerDisplayName}...`
+                            : 'Type a message... (Enter to send)'
                     }
                     value={newMessage}
                     onChange={e => setNewMessage(e.target.value)}
