@@ -19,12 +19,20 @@ import type {
 } from './types'
 
 interface PeerHeartbeat {
+  type?: 'heartbeat'
   app: 'ed-desk'
   peerId: string
   displayName: string
   port: number
   capabilities: string[]
   hostedSession: HostedSessionSummary | null
+  timestamp: number
+}
+
+interface DiscoveryProbe {
+  type: 'probe'
+  app: 'ed-desk'
+  peerId: string
   timestamp: number
 }
 
@@ -157,12 +165,17 @@ export class OfflineBackendService {
   }
 
   private async startDiscovery(): Promise<void> {
-    this.discoverySocket = dgram.createSocket('udp4')
+    this.discoverySocket = dgram.createSocket({ type: 'udp4', reuseAddr: true })
 
     this.discoverySocket.on('message', (buffer, remote) => {
       try {
-        const payload = JSON.parse(buffer.toString()) as PeerHeartbeat
+        const payload = JSON.parse(buffer.toString()) as PeerHeartbeat | DiscoveryProbe
         if (payload.app !== 'ed-desk' || payload.peerId === this.peerId) {
+          return
+        }
+
+        if (payload.type === 'probe') {
+          this.broadcastHeartbeat(remote.address)
           return
         }
 
@@ -226,8 +239,9 @@ export class OfflineBackendService {
     }
   }
 
-  private broadcastHeartbeat(): void {
+  private broadcastHeartbeat(targetAddress?: string): void {
     const payload: PeerHeartbeat = {
+      type: 'heartbeat',
       app: 'ed-desk',
       peerId: this.peerId,
       displayName: this.displayName,
@@ -238,7 +252,86 @@ export class OfflineBackendService {
     }
 
     const message = Buffer.from(JSON.stringify(payload))
-    this.discoverySocket?.send(message, this.discoveryPort, '255.255.255.255')
+    const targets = targetAddress ? [targetAddress] : this.getDiscoveryBroadcastAddresses()
+    for (const address of targets) {
+      this.discoverySocket?.send(message, this.discoveryPort, address, () => {
+        // Best-effort LAN discovery; ignore per-target send errors.
+      })
+    }
+  }
+
+  private sendDiscoveryProbe(): void {
+    const message = Buffer.from(JSON.stringify({
+      type: 'probe',
+      app: 'ed-desk',
+      peerId: this.peerId,
+      timestamp: Date.now()
+    } satisfies DiscoveryProbe))
+
+    for (const address of this.getDiscoveryBroadcastAddresses()) {
+      this.discoverySocket?.send(message, this.discoveryPort, address, () => {
+        // Best-effort LAN discovery; ignore per-target send errors.
+      })
+    }
+  }
+
+  private getDiscoveryBroadcastAddresses(): string[] {
+    const addresses = new Set<string>(['255.255.255.255'])
+    const interfaces = os.networkInterfaces()
+
+    for (const addrs of Object.values(interfaces)) {
+      for (const addr of addrs ?? []) {
+        if (addr.family !== 'IPv4' || addr.internal || !addr.netmask) continue
+        const broadcast = this.computeBroadcastAddress(addr.address, addr.netmask)
+        if (broadcast) addresses.add(broadcast)
+      }
+    }
+
+    return [...addresses]
+  }
+
+  private computeBroadcastAddress(ip: string, netmask: string): string | null {
+    const ipInt = this.ipv4ToInt(ip)
+    const maskInt = this.ipv4ToInt(netmask)
+    if (ipInt == null || maskInt == null) return null
+
+    const broadcast = (ipInt | (~maskInt >>> 0)) >>> 0
+    return this.intToIpv4(broadcast)
+  }
+
+  private ipv4ToInt(ip: string): number | null {
+    const parts = ip.split('.').map((part) => Number(part))
+    if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+      return null
+    }
+
+    return (((parts[0] << 24) >>> 0) |
+      ((parts[1] << 16) >>> 0) |
+      ((parts[2] << 8) >>> 0) |
+      (parts[3] >>> 0)) >>> 0
+  }
+
+  private intToIpv4(value: number): string {
+    return [
+      (value >>> 24) & 255,
+      (value >>> 16) & 255,
+      (value >>> 8) & 255,
+      value & 255
+    ].join('.')
+  }
+
+  private async waitForPeerBySessionCode(code: string, timeoutMs = 3000): Promise<PeerRecord | null> {
+    const startedAt = Date.now()
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const peer = this.listPeers().find((item) => item.status === 'online' && item.hostedSession?.code === code)
+      if (peer?.hostedSession) return peer
+      this.sendDiscoveryProbe()
+      this.broadcastHeartbeat()
+      await new Promise((resolve) => setTimeout(resolve, 350))
+    }
+
+    return this.listPeers().find((item) => item.status === 'online' && item.hostedSession?.code === code) ?? null
   }
 
   private async readJson<T>(request: IncomingMessage): Promise<T> {
@@ -369,6 +462,7 @@ export class OfflineBackendService {
     if (this.getPermissions().nearbyScan !== 'granted') {
       throw new Error('Nearby device permission is not granted.')
     }
+    this.sendDiscoveryProbe()
     this.broadcastHeartbeat()
     return this.listPeers()
   }
@@ -457,10 +551,7 @@ export class OfflineBackendService {
     const findLivePeer = () => this.listPeers().find((peer) => peer.status === 'online' && peer.hostedSession?.code === normalizedCode)
     const stalePeer = this.listPeers().find((peer) => peer.hostedSession?.code === normalizedCode)
     const directMatch = findLivePeer()
-    const peer = directMatch ?? (() => {
-      this.broadcastHeartbeat()
-      return findLivePeer()
-    })()
+    const peer = directMatch ?? await this.waitForPeerBySessionCode(normalizedCode)
 
     if (!peer || !peer.hostedSession) {
       if (stalePeer) {
