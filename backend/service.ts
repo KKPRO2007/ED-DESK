@@ -523,6 +523,19 @@ export class OfflineBackendService {
     return '127.0.0.1'
   }
 
+  private getLocalIpv4Addresses(): string[] {
+    const addresses = new Set<string>()
+    const interfaces = os.networkInterfaces()
+    for (const addrs of Object.values(interfaces)) {
+      for (const addr of addrs ?? []) {
+        if (addr.family === 'IPv4' && !addr.internal) {
+          addresses.add(addr.address)
+        }
+      }
+    }
+    return [...addresses]
+  }
+
   private normalizeRemoteAddress(address?: string | null): string {
     if (!address) return ''
     return address.startsWith('::ffff:') ? address.slice(7) : address
@@ -534,13 +547,15 @@ export class OfflineBackendService {
     for (const peer of this.listPeers()) {
       if (peer.address && peer.address !== this.localAddress) candidates.add(peer.address)
     }
-    // Then sweep the subnet
-    const localParts = this.localAddress.split('.')
-    if (localParts.length === 4) {
-      const prefix = localParts.slice(0, 3).join('.')
-      for (let i = 1; i < 255; i++) {
-        const candidate = `${prefix}.${i}`
-        if (candidate !== this.localAddress) candidates.add(candidate)
+    // Then sweep every active local IPv4 subnet (/24 heuristic for speed)
+    for (const localIp of this.getLocalIpv4Addresses()) {
+      const localParts = localIp.split('.')
+      if (localParts.length === 4) {
+        const prefix = localParts.slice(0, 3).join('.')
+        for (let i = 1; i < 255; i++) {
+          const candidate = `${prefix}.${i}`
+          if (candidate !== localIp) candidates.add(candidate)
+        }
       }
     }
     return [...candidates]
