@@ -199,6 +199,15 @@ export class BackendDatabase {
     return [...(this.messages.get(conversationId) ?? [])]
   }
 
+  findMessageBySessionMessageId(
+    conversationId: string,
+    sessionMessageId: string
+  ): ChatMessageRecord | undefined {
+    return (this.messages.get(conversationId) ?? []).find(
+      (message) => message.sessionMessageId === sessionMessageId
+    )
+  }
+
   addMessage(input: AddMessageInput): ChatMessageRecord {
     const previousHash = this.lastMessageHash(input.conversationId)
     const hash = this.hashValue({ ...input, previousHash })

@@ -37,6 +37,7 @@ export interface ChatMessageRecord {
   peerName: string
   senderName: string
   recipientName: string
+  sessionMessageId?: string
   content: string
   direction: 'incoming' | 'outgoing'
   transport: 'wifi' | 'demo' | 'local'

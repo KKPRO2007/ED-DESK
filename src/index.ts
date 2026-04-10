@@ -62,6 +62,19 @@ interface WindowsInfoRow {
   OsVersion?: string
 }
 
+interface WiFiInterfaceInfo {
+  iface: string
+  ip4: string
+  mac: string
+  operstate: string
+  type: 'wireless'
+  speed: number
+  ssid?: string
+  signal?: number
+  channel?: number
+  frequency?: number
+}
+
 async function runPowerShellJson<T>(command: string): Promise<T | null> {
   try {
     const output = await new Promise<string>((resolve, reject) => {
@@ -260,7 +273,7 @@ async function getDetailedBatteryInfo() {
 
 function getWiFiInfo() {
   const interfaces = os.networkInterfaces()
-  const wifiInterfaces = []
+  const wifiInterfaces: WiFiInterfaceInfo[] = []
   for (const [name, addrs] of Object.entries(interfaces)) {
     const isWireless = /wlan|wi-?fi|wireless|802\.11/i.test(name)
     if (!addrs || !isWireless) continue
@@ -474,12 +487,20 @@ app.whenReady().then(async () => {
   ipcMain.handle('offline:get-messages', async (_event, conversationId: string) =>
     (await ensureBackendService()).getMessages(conversationId)
   )
+  ipcMain.handle('offline:get-session-messages', async (_event, sessionCode: string) =>
+    (await ensureBackendService()).getSessionMessages(sessionCode)
+  )
   ipcMain.handle(
     'offline:send-message',
     async (_event, peerId: string, content: string, sessionCode?: string, attachment?: {
       type: string; name: string; size: number; mime: string; data: string
+    }, options?: {
+      persistLocal?: boolean
+      sessionMessageId?: string
+      senderPeerId?: string
+      senderName?: string
     }) =>
-      await (await ensureBackendService()).sendLanMessage(peerId, content, sessionCode, attachment as never)
+      await (await ensureBackendService()).sendLanMessage(peerId, content, sessionCode, attachment as never, options)
   )
   ipcMain.handle('offline:get-attachment', async (_event, attachmentId: string) =>
     (await ensureBackendService()).getAttachment(attachmentId)

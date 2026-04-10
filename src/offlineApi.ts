@@ -37,6 +37,7 @@ export interface ChatMessageRecord {
   peerName: string
   senderName: string
   recipientName: string
+  sessionMessageId?: string
   content: string
   direction: 'incoming' | 'outgoing'
   transport: 'wifi' | 'demo' | 'local'
@@ -181,9 +182,16 @@ export const offlineApi = {
       size: number
       mime: string
       data: string
+    },
+    options?: {
+      persistLocal?: boolean
+      sessionMessageId?: string
+      senderPeerId?: string
+      senderName?: string
     }
-  ) => window.electronAPI.offline.sendMessage(peerId, content, sessionCode, attachment) as Promise<ChatMessageRecord>,
+  ) => window.electronAPI.offline.sendMessage(peerId, content, sessionCode, attachment, options) as Promise<ChatMessageRecord>,
   getAttachment: (attachmentId: string) => window.electronAPI.offline.getAttachment(attachmentId) as Promise<AttachmentRecord | undefined>,
+  getSessionMessages: (sessionCode: string) => window.electronAPI.offline.getSessionMessages(sessionCode) as Promise<ChatMessageRecord[]>,
   saveAttachmentToDisk: (attachmentId: string, suggestedName: string) => window.electronAPI.offline.saveAttachmentToDisk(attachmentId, suggestedName) as Promise<{ canceled: boolean; filePath?: string }>,
   removeParticipant: (peerId: string) => window.electronAPI.offline.removeParticipant(peerId) as Promise<void>,
   listAssessments: () => window.electronAPI.offline.listAssessments() as Promise<AssessmentRecord[]>,

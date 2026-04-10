@@ -76,6 +76,7 @@ interface HistoryEntry {
   session: Session
   lastMessage: string
   unreadCount: number
+  conversationIds: string[]
 }
 
 interface PendingFile {
@@ -183,7 +184,7 @@ const loadSavedSession = (): Session | null => {
     if (!raw) return null
     const p = JSON.parse(raw) as Record<string, unknown>
     return {
-      ...(p as Session),
+      ...(p as unknown as Session),
       created: new Date(p.created as string),
       lastActivity: new Date(p.lastActivity as string)
     }
@@ -217,6 +218,51 @@ const findBestConversation = (
   if (peerConvs.length === 1) return peerConvs[0]
   return peerConvs.find((c) => c.sessionCode) ?? peerConvs[0]
 }
+
+const findSessionConversations = (
+  convs: ConversationRecord[],
+  code?: string | null
+): ConversationRecord[] => {
+  const norm = code?.trim().toUpperCase() || null
+  if (!norm) return []
+  return convs
+    .filter((conv) => (conv.sessionCode ?? null) === norm)
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+}
+
+const buildHistoryEntries = (
+  convs: ConversationRecord[],
+  peers: PeerRecord[],
+  myName: string
+): HistoryEntry[] => {
+  const grouped = new Map<string, ConversationRecord[]>()
+  for (const conv of convs) {
+    const key = conv.sessionCode ? `session:${conv.sessionCode}` : `conv:${conv.id}`
+    const bucket = grouped.get(key) ?? []
+    bucket.push(conv)
+    grouped.set(key, bucket)
+  }
+
+  return [...grouped.values()]
+    .map((group) => {
+      const sorted = [...group].sort((a, b) => b.updatedAt - a.updatedAt)
+      const primary = sorted[0]
+      const hostPeer = primary.sessionCode
+        ? peers.find((peer) => peer.hostedSession?.code === primary.sessionCode)
+        : undefined
+      const directPeer = peers.find((peer) => peer.id === primary.peerId)
+      return {
+        session: buildHistorySession(primary, hostPeer ?? directPeer, myName),
+        lastMessage: formatConversationPreview(primary.lastMessage),
+        unreadCount: group.reduce((sum, item) => sum + item.unreadCount, 0),
+        conversationIds: group.map((item) => item.id)
+      }
+    })
+    .sort((a, b) => b.session.lastActivity.getTime() - a.session.lastActivity.getTime())
+}
+
+const makeSessionMessageId = (): string =>
+  `session-msg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
 
 const buildPeerSession = (
   peer: PeerRecord,
@@ -376,6 +422,53 @@ export default function Chat() {
     setTimeout(() => setError(null), 5000)
   }, [])
 
+  const buildPeerParticipants = useCallback(
+    (
+      session: Session,
+      snap: {
+        status: BackendStatus | null
+        profile: { peerId: string; displayName: string } | null
+        peers: PeerRecord[]
+        convs: ConversationRecord[]
+      }
+    ): Participant[] => {
+      const entries = new Map<string, Participant>()
+      entries.set(snap.profile?.peerId ?? 'local', {
+        id: snap.profile?.peerId ?? 'local',
+        name: snap.profile?.displayName ?? 'You',
+        role: inferRole(snap.profile?.displayName ?? 'You'),
+        status: 'online',
+        joinedAt: new Date(),
+        device: 'This Device',
+        ipAddress: snap.status?.localAddress ?? '127.0.0.1',
+        messagesSent: 0
+      })
+
+      const sessionConvs = findSessionConversations(snap.convs, session.code)
+      const peerIds = new Set<string>([session.peerId, ...sessionConvs.map((conv) => conv.peerId)])
+
+      for (const peerId of peerIds) {
+        const peer = snap.peers.find((item) => item.id === peerId)
+        const conv = sessionConvs.find((item) => item.peerId === peerId)
+        const isHost = peerId === session.peerId
+        const isLiveHost = isHost && peer?.status === 'online' && peer.hostedSession?.code === session.code
+        entries.set(peerId, {
+          id: peerId,
+          name: peer?.displayName ?? conv?.peerName ?? (isHost ? session.peerDisplayName : 'Participant'),
+          role: inferRole(peer?.displayName ?? conv?.peerName ?? session.peerDisplayName),
+          status: isLiveHost ? 'online' : peer?.status === 'online' ? 'online' : 'away',
+          joinedAt: conv ? new Date(conv.updatedAt) : session.created,
+          device: peer?.displayName ?? conv?.peerName ?? 'LAN Peer',
+          ipAddress: peer?.address ?? (isHost ? session.address : ''),
+          messagesSent: 0
+        })
+      }
+
+      return [...entries.values()]
+    },
+    []
+  )
+
   // ── Clock ─────────────────────────────────────────────────────────────────
   useEffect(() => {
     const t = setInterval(() => setTime(new Date()), 1000)
@@ -469,14 +562,7 @@ export default function Chat() {
             buildPeerSession(p, findBestConversation(convs, p.id, p.hostedSession?.code), profileData?.displayName ?? 'You')
           )
 
-        const history = convs.map((conv) => {
-          const peer = peers.find((p) => p.id === conv.peerId)
-          return {
-            session: buildHistorySession(conv, peer, profileData?.displayName ?? 'You'),
-            lastMessage: formatConversationPreview(conv.lastMessage),
-            unreadCount: conv.unreadCount
-          }
-        })
+        const history = buildHistoryEntries(convs, peers, profileData?.displayName ?? 'You')
 
         if (applyState) {
           setBackendStatus(status)
@@ -534,6 +620,7 @@ export default function Chat() {
       }
       knownMsgIdsRef.current.add(sysId)
 
+      const baseMessages: Message[] = [systemMsg]
       if (session.mode === 'host') {
         const codeId = `host-code-${session.code}`
         const codeMsg: Message = {
@@ -542,27 +629,29 @@ export default function Chat() {
           timestamp: new Date(), isOwn: false, system: true
         }
         knownMsgIdsRef.current.add(codeId)
-        setMessages([systemMsg, codeMsg])
-        setPacketCount(0); setRxBytes(0); setTxBytes(0)
-        return
-      }
-
-      if (!session.conversationId) {
-        const emptyId = `empty-${session.peerId}`
-        const emptyMsg: Message = {
-          id: emptyId, sender: 'System', role: 'system',
-          content: `CONNECTED TO ${session.name.toUpperCase()} · Send a message to start`,
-          timestamp: new Date(), isOwn: false, system: true
-        }
-        knownMsgIdsRef.current.add(emptyId)
-        setMessages([systemMsg, emptyMsg])
-        return
+        baseMessages.push(codeMsg)
       }
 
       try {
-        const records = await offlineApi.getMessages(session.conversationId)
+        const records = session.code
+          ? await offlineApi.getSessionMessages(session.code)
+          : session.conversationId
+            ? await offlineApi.getMessages(session.conversationId)
+            : []
+
+        if (records.length === 0 && session.mode === 'peer') {
+          const emptyId = `empty-${session.peerId}`
+          const emptyMsg: Message = {
+            id: emptyId, sender: 'System', role: 'system',
+            content: `CONNECTED TO ${session.name.toUpperCase()} · Send a message to start`,
+            timestamp: new Date(), isOwn: false, system: true
+          }
+          knownMsgIdsRef.current.add(emptyId)
+          baseMessages.push(emptyMsg)
+        }
+
         const mapped = records.map((r) => mapRecord(r, prof))
-        const all = dedupeById([systemMsg, ...mapped])
+        const all = dedupeById([...baseMessages, ...mapped])
         all.forEach((m) => knownMsgIdsRef.current.add(m.id))
         setMessages(all)
         setPacketCount(records.length)
@@ -594,24 +683,13 @@ export default function Chat() {
       const prof = snap?.profile ?? null
 
       if (session.mode === 'peer' && snap) {
-        const freshConv = findBestConversation(snap.convs, session.peerId, session.code)
+        const sessionConvs = findSessionConversations(snap.convs, session.code)
+        const freshConv =
+          findBestConversation(snap.convs, session.peerId, session.code) ??
+          sessionConvs[0]
         const freshSession = { ...session, conversationId: freshConv?.id ?? null }
         setCurrentSession(freshSession)
-        setParticipants([
-          {
-            id: prof?.peerId ?? 'local', name: prof?.displayName ?? 'You',
-            role: inferRole(prof?.displayName ?? 'You'), status: 'online',
-            joinedAt: new Date(), device: 'This Device',
-            ipAddress: status?.localAddress ?? '127.0.0.1', messagesSent: 0
-          },
-          {
-            id: session.peerId, name: session.peerDisplayName,
-            role: inferRole(session.peerDisplayName),
-            status: session.status === 'online' ? 'online' : 'away',
-            joinedAt: session.created, device: session.peerDisplayName,
-            ipAddress: session.address, messagesSent: 0
-          }
-        ])
+        setParticipants(buildPeerParticipants(freshSession, snap))
         await loadMessages(freshSession, status, prof)
       } else {
         setParticipants([
@@ -625,7 +703,7 @@ export default function Chat() {
         await loadMessages(session, status, prof)
       }
     },
-    [addLog, loadMessages, loadSnapshot, navigate]
+    [addLog, buildPeerParticipants, loadMessages, loadSnapshot, navigate]
   )
 
   // ── Back to welcome (exit history/session view without leaving) ───────────
@@ -654,7 +732,13 @@ export default function Chat() {
             hosted.participantPeerIds.map(async (pid) => {
               const peer = snap.peers.find((p) => p.id === pid)
               if (peer) {
-                await offlineApi.sendMessage(pid, `__SYS__:HOST_CLOSED:${sess.code}`, sess.code).catch(() => {})
+                await offlineApi.sendMessage(
+                  pid,
+                  `__SYS__:HOST_CLOSED:${sess.code}`,
+                  sess.code,
+                  undefined,
+                  { persistLocal: false }
+                ).catch(() => {})
               }
             })
           )
@@ -668,7 +752,9 @@ export default function Chat() {
         await offlineApi.sendMessage(
           sess.peerId,
           `__SYS__:PEER_LEFT:${profile?.displayName ?? 'A user'}`,
-          sess.code
+          sess.code,
+          undefined,
+          { persistLocal: false }
         )
       } catch { /* ignore */ }
     }
@@ -687,7 +773,9 @@ export default function Chat() {
         await offlineApi.sendMessage(
           participant.id,
           `__SYS__:KICKED:${participant.name}`,
-          currentSession.code
+          currentSession.code,
+          undefined,
+          { persistLocal: false }
         ).catch(() => {})
         // Actually remove from backend session
         await offlineApi.removeParticipant(participant.id)
@@ -709,7 +797,9 @@ export default function Chat() {
 
       const currentPeer = snap.peers.find((p) => p.id === session.peerId)
       const sessionStatus =
-        session.mode === 'peer' ? (currentPeer?.status ?? session.status) : 'online'
+        session.mode === 'peer'
+          ? (currentPeer?.status === 'online' && currentPeer.hostedSession?.code === session.code ? 'online' : 'stale')
+          : 'online'
 
       // Update system status message in-place
       const sysContent = `BACKEND · ${snap.status?.localAddress ?? '127.0.0.1'}:${snap.status?.serverPort ?? 0} · WIFI ${sessionStatus.toUpperCase()}`
@@ -736,8 +826,6 @@ export default function Chat() {
             device: 'This Device', ipAddress: snap.status?.localAddress ?? '127.0.0.1', messagesSent: 0
           }
         ]
-
-        const allRecords: ChatMessageRecord[] = []
         const seenPeerIds = new Set<string>()
 
         for (const pid of hosted.participantPeerIds) {
@@ -754,13 +842,9 @@ export default function Chat() {
             })
             injectSys(`join-${pid}`, `${peer.displayName} joined the session`)
           }
-          const conv = findBestConversation(snap.convs, pid, session.code)
-          if (!conv) continue
-          const records = await offlineApi.getMessages(conv.id).catch(() => [] as ChatMessageRecord[])
-          allRecords.push(...records)
         }
 
-        allRecords.sort((a, b) => a.createdAt - b.createdAt)
+        const allRecords = await offlineApi.getSessionMessages(session.code).catch(() => [] as ChatMessageRecord[])
         const newRecords = allRecords.filter((r) => !knownMsgIdsRef.current.has(r.id))
         if (newRecords.length > 0) {
           const mapped = newRecords.map((r) => mapRecord(r, snap.profile))
@@ -770,51 +854,42 @@ export default function Chat() {
 
         setParticipants(nextParticipants)
         setPacketCount(allRecords.length)
+        setRxBytes(allRecords.filter((r) => r.direction === 'incoming').reduce((s, r) => s + r.content.length * 2, 0))
+        setTxBytes(allRecords.filter((r) => r.direction === 'outgoing').reduce((s, r) => s + r.content.length * 2, 0))
         return
       }
 
       // Peer mode
+      const sessionConvs = findSessionConversations(snap.convs, session.code)
       const convId =
         findBestConversation(snap.convs, session.peerId, session.code)?.id ??
+        sessionConvs[0]?.id ??
         session.conversationId
+      const hostStillHosting = currentPeer?.status === 'online' && currentPeer.hostedSession?.code === session.code
+      const participantList = buildPeerParticipants(session, snap)
       const updatedSession: Session = {
         ...session,
-        name: currentPeer?.hostedSession?.name?.trim() || session.name,
+        name: hostStillHosting ? (currentPeer?.hostedSession?.name?.trim() || session.name) : session.name,
         peerDisplayName: currentPeer?.displayName ?? session.peerDisplayName,
-        status: sessionStatus,
-        conversationId: convId
+        status: hostStillHosting ? 'online' : 'stale',
+        conversationId: convId,
+        participants: Math.max(participantList.length, session.participants)
       }
       setCurrentSession(updatedSession)
       saveActiveSession(updatedSession)
 
-      if (sessionStatus === 'stale' && session.status === 'online') {
+      if (!hostStillHosting && session.status === 'online') {
         injectSys(
           `leave-${session.peerId}-${Date.now()}`,
-          `${session.peerDisplayName} disconnected`
+          `${session.peerDisplayName} closed or left this session`
         )
       }
 
-      setParticipants([
-        {
-          id: snap.profile?.peerId ?? 'local',
-          name: snap.profile?.displayName ?? 'You',
-          role: inferRole(snap.profile?.displayName ?? 'You'),
-          status: 'online', joinedAt: new Date(),
-          device: 'This Device', ipAddress: snap.status?.localAddress ?? '127.0.0.1', messagesSent: 0
-        },
-        {
-          id: session.peerId,
-          name: currentPeer?.displayName ?? session.peerDisplayName,
-          role: inferRole(currentPeer?.displayName ?? session.peerDisplayName),
-          status: sessionStatus === 'online' ? 'online' : 'away',
-          joinedAt: session.created, device: currentPeer?.displayName ?? session.peerDisplayName,
-          ipAddress: currentPeer?.address ?? session.address, messagesSent: 0
-        }
-      ])
+      setParticipants(participantList)
 
-      if (!convId) { setPacketCount(0); return }
+      const records = await offlineApi.getSessionMessages(session.code).catch(() => [] as ChatMessageRecord[])
+      if (records.length === 0 && !convId) { setPacketCount(0); return }
 
-      const records = await offlineApi.getMessages(convId).catch(() => [] as ChatMessageRecord[])
       const newRecords = records.filter((r) => !knownMsgIdsRef.current.has(r.id))
       if (newRecords.length > 0) {
         const mapped = newRecords.map((r) => mapRecord(r, snap.profile))
@@ -826,7 +901,7 @@ export default function Chat() {
       setRxBytes(records.filter((r) => r.direction === 'incoming').reduce((s, r) => s + r.content.length * 2, 0))
       setTxBytes(records.filter((r) => r.direction === 'outgoing').reduce((s, r) => s + r.content.length * 2, 0))
     },
-    [injectSys, loadSnapshot, mapRecord]
+    [buildPeerParticipants, injectSys, loadSnapshot, mapRecord]
   )
 
   // ── Bootstrap ─────────────────────────────────────────────────────────────
@@ -1030,8 +1105,13 @@ export default function Chat() {
   const deleteHistory = useCallback(
     async (entry: HistoryEntry) => {
       try {
-        await offlineApi.deleteConversation(entry.session.conversationId ?? '')
-        if (currentSession?.conversationId === entry.session.conversationId) {
+        await Promise.allSettled(
+          entry.conversationIds.map((conversationId) => offlineApi.deleteConversation(conversationId))
+        )
+        if (
+          currentSession?.code === entry.session.code ||
+          (currentSession?.conversationId != null && entry.conversationIds.includes(currentSession.conversationId))
+        ) {
           backToWelcome()
         }
         await loadSnapshot(false)
@@ -1123,11 +1203,13 @@ export default function Chat() {
         }
       : undefined
 
+    const sessionMessageId = makeSessionMessageId()
     const sendTo = async (peerId: string) => {
-      await offlineApi.sendMessage(peerId, text, currentSession.code, attachment)
+      await offlineApi.sendMessage(peerId, text, currentSession.code, attachment, { sessionMessageId })
     }
 
     try {
+      let targetPeerIds: string[] = []
       if (currentSession.mode === 'host') {
         const hosted = await offlineApi.getHostedSession().catch(() => null)
         if (!hosted || hosted.participantPeerIds.length === 0) {
@@ -1136,18 +1218,29 @@ export default function Chat() {
           knownMsgIdsRef.current.delete(optimisticId)
           return
         }
-        await Promise.allSettled(hosted.participantPeerIds.map(sendTo))
+        targetPeerIds = hosted.participantPeerIds
       } else if (broadcastMode) {
-        await Promise.allSettled(peerRecords.filter((p) => p.status === 'online').map((p) => sendTo(p.id)))
+        targetPeerIds = peerRecords.filter((p) => p.status === 'online').map((p) => p.id)
       } else {
-        await sendTo(currentSession.peerId)
+        targetPeerIds = [currentSession.peerId]
+      }
+
+      const results = await Promise.allSettled(targetPeerIds.map(sendTo))
+      const succeeded = results.filter((result) => result.status === 'fulfilled').length
+      if (succeeded === 0) {
+        const firstFailure = results.find((result) => result.status === 'rejected')
+        throw new Error(firstFailure?.status === 'rejected' ? getErr(firstFailure.reason) : 'Message delivery failed')
       }
 
       setMessages((prev) =>
         prev.filter((m) => m.id !== optimisticId)
       )
       knownMsgIdsRef.current.delete(optimisticId)
-      addLog(`Message sent${file ? ` [${file.fileType.toUpperCase()}: ${file.name}]` : ''}`)
+      addLog(
+        succeeded < targetPeerIds.length
+          ? `Message sent to ${succeeded}/${targetPeerIds.length}${file ? ` [${file.fileType.toUpperCase()}: ${file.name}]` : ''}`
+          : `Message sent${file ? ` [${file.fileType.toUpperCase()}: ${file.name}]` : ''}`
+      )
     } catch (e) {
       showErr(`Send failed: ${getErr(e)}`)
       setMessages((prev) =>
@@ -1366,8 +1459,8 @@ export default function Chat() {
             <div className="history-list">
               {historyEntries.map((entry) => (
                 <div
-                  key={entry.session.conversationId ?? `${entry.session.peerId}-${entry.session.code}`}
-                  className={`history-item ${currentSession?.conversationId === entry.session.conversationId ? 'history-item-active' : ''}`}
+                  key={entry.conversationIds.join('|')}
+                  className={`history-item ${currentSession?.code === entry.session.code ? 'history-item-active' : ''}`}
                 >
                   <button
                     className="history-open"

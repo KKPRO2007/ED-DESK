@@ -42,10 +42,18 @@ const electronAPI = {
         size: number
         mime: string
         data: string
+      },
+      options?: {
+        persistLocal?: boolean
+        sessionMessageId?: string
+        senderPeerId?: string
+        senderName?: string
       }
-    ) => ipcRenderer.invoke('offline:send-message', peerId, content, sessionCode, attachment),
+    ) => ipcRenderer.invoke('offline:send-message', peerId, content, sessionCode, attachment, options),
     getAttachment: (attachmentId: string) =>
       ipcRenderer.invoke('offline:get-attachment', attachmentId),
+    getSessionMessages: (sessionCode: string) =>
+      ipcRenderer.invoke('offline:get-session-messages', sessionCode),
     saveAttachmentToDisk: (attachmentId: string, suggestedName: string) =>
       ipcRenderer.invoke('offline:save-attachment-to-disk', attachmentId, suggestedName),
     removeParticipant: (peerId: string) =>

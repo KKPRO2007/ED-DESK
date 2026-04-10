@@ -40,11 +40,14 @@ interface DiscoveryProbe {
 interface PeerMessagePayload {
   peerId: string
   peerName: string
+  senderPeerId?: string
+  senderName?: string
   recipientName: string
   content: string
   timestamp: number
   serverPort: number
   sessionCode?: string
+  sessionMessageId?: string
   // Attachment metadata (data transferred separately via HTTP)
   attachmentId?: string
   attachmentType?: AttachmentRecord['type']
@@ -63,11 +66,25 @@ interface JoinSessionPayload {
   password?: string
 }
 
+interface SendLanMessageOptions {
+  persistLocal?: boolean
+  sessionMessageId?: string
+  senderPeerId?: string
+  senderName?: string
+}
+
 // System message prefix – these are never stored in DB
 const SYS_PREFIX = '__SYS__:'
 
 function isSysMessage(content: string): boolean {
   return content.startsWith(SYS_PREFIX)
+}
+
+function parseSysMessage(content: string): { command: string; value: string } | null {
+  if (!isSysMessage(content)) return null
+  const body = content.slice(SYS_PREFIX.length)
+  const [command, ...rest] = body.split(':')
+  return { command, value: rest.join(':') }
 }
 
 export class OfflineBackendService {
@@ -133,10 +150,11 @@ export class OfflineBackendService {
           const payload = await this.readJson<PeerMessagePayload>(request)
           // Silently discard system messages – do not persist
           if (isSysMessage(payload.content)) {
+            this.handleSystemMessage(payload, request.socket.remoteAddress)
             this.writeJson(response, 200, { ok: true })
             return
           }
-          const message = this.receivePeerMessage(payload, request.socket.remoteAddress)
+          const message = await this.receivePeerMessage(payload, request.socket.remoteAddress)
           this.writeJson(response, 200, { ok: true, message })
           return
         }
@@ -734,8 +752,7 @@ export class OfflineBackendService {
         } satisfies JoinSessionPayload
       )
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      if (/ETIMEDOUT|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH/i.test(message)) {
+      if (this.isReachabilityError(error)) {
         this.database.upsertPeer({ ...peer, status: 'stale', hostedSession: null })
         throw new Error(`Session code ${normalizedCode} is offline or unreachable right now.`)
       }
@@ -797,20 +814,154 @@ export class OfflineBackendService {
 
   getMessages(conversationId: string): ChatMessageRecord[] {
     this.database.markConversationRead(conversationId)
-    return this.database.listMessages(conversationId).map((message) => {
-      if (!message.attachmentId) return message
-      const attachment = this.database.getAttachment(message.attachmentId)
-      if (!attachment) return message
-      return {
-        ...message,
-        attachmentData: attachment.data
-      }
-    })
+    return this.database.listMessages(conversationId).map((message) => this.hydrateMessage(message))
   }
 
   private isReachabilityError(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error)
     return /ETIMEDOUT|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|Request timed out|Timeout/i.test(message)
+  }
+
+  private normalizeSessionCode(code?: string | null): string | null {
+    const normalized = code?.trim().toUpperCase()
+    return normalized || null
+  }
+
+  private hydrateMessage(message: ChatMessageRecord): ChatMessageRecord {
+    if (!message.attachmentId) return message
+    const attachment = this.database.getAttachment(message.attachmentId)
+    if (!attachment) return message
+    return {
+      ...message,
+      attachmentData: attachment.data
+    }
+  }
+
+  private collapseSessionMessages(records: ChatMessageRecord[]): ChatMessageRecord[] {
+    const grouped = new Map<string, ChatMessageRecord[]>()
+    for (const record of records) {
+      const key = record.sessionMessageId ?? record.id
+      const bucket = grouped.get(key) ?? []
+      bucket.push(record)
+      grouped.set(key, bucket)
+    }
+
+    const collapsed = [...grouped.values()].map((group) => {
+      if (group.length === 1) return group[0]
+      const ordered = [...group].sort((a, b) => a.createdAt - b.createdAt)
+      const preferred =
+        ordered.find((item) => item.direction === 'incoming') ??
+        ordered[0]
+      const deliveredAt = ordered.reduce(
+        (latest, item) => Math.max(latest, item.deliveredAt ?? 0),
+        0
+      )
+      const status: ChatMessageRecord['status'] =
+        ordered.some((item) => item.status === 'delivered')
+          ? 'delivered'
+          : ordered.some((item) => item.status === 'pending')
+            ? 'pending'
+            : 'failed'
+      return {
+        ...preferred,
+        status,
+        deliveredAt: deliveredAt || preferred.deliveredAt
+      }
+    })
+
+    return collapsed.sort((a, b) => a.createdAt - b.createdAt)
+  }
+
+  getSessionMessages(sessionCode: string): ChatMessageRecord[] {
+    const normalizedCode = this.normalizeSessionCode(sessionCode)
+    if (!normalizedCode) return []
+    const conversations = this.listConversations().filter(
+      (conversation) => (conversation.sessionCode ?? null) === normalizedCode
+    )
+    conversations.forEach((conversation) => this.database.markConversationRead(conversation.id))
+    const records = conversations.flatMap((conversation) =>
+      this.database.listMessages(conversation.id).map((message) => this.hydrateMessage(message))
+    )
+    return this.collapseSessionMessages(records)
+  }
+
+  private handleSystemMessage(
+    payload: PeerMessagePayload,
+    remoteAddress?: string | null
+  ): void {
+    this.upsertPeerConnection(payload.peerId, payload.peerName, payload.serverPort, remoteAddress)
+    const parsed = parseSysMessage(payload.content)
+    if (!parsed) return
+
+    if (parsed.command === 'PEER_LEFT') {
+      const hosted = this.database.getHostedSession()
+      const sessionCode = this.normalizeSessionCode(payload.sessionCode)
+      if (!hosted || !sessionCode || hosted.code !== sessionCode) return
+      if (!hosted.participantPeerIds.includes(payload.peerId)) return
+      const updated: SessionRecord = {
+        ...hosted,
+        participantPeerIds: hosted.participantPeerIds.filter((id) => id !== payload.peerId),
+        updatedAt: Date.now(),
+        status: hosted.participantPeerIds.length > 1 ? 'active' : 'waiting'
+      }
+      this.database.saveHostedSession(updated)
+      this.database.addLedgerRecord({
+        entityType: 'message',
+        entityId: hosted.id,
+        action: 'participant-left',
+        payload: { peerId: payload.peerId, code: hosted.code }
+      })
+      this.broadcastHeartbeat()
+      return
+    }
+
+    if (parsed.command === 'HOST_CLOSED' || parsed.command === 'KICKED') {
+      const peer = this.database.getPeer(payload.peerId)
+      if (!peer) return
+      this.database.upsertPeer({
+        ...peer,
+        hostedSession: null,
+        lastSeen: Date.now(),
+        status: 'online'
+      })
+    }
+  }
+
+  private async relaySessionMessage(
+    hosted: SessionRecord,
+    payload: PeerMessagePayload
+  ): Promise<void> {
+    const senderPeerId = payload.senderPeerId ?? payload.peerId
+    const senderName = payload.senderName ?? payload.peerName
+    const attachment = payload.attachmentId && payload.attachmentData
+      ? {
+          type: payload.attachmentType ?? 'file',
+          name: payload.attachmentName ?? 'file',
+          size: payload.attachmentSize ?? 0,
+          mime: payload.attachmentMime ?? 'application/octet-stream',
+          data: payload.attachmentData
+        }
+      : undefined
+
+    const recipients = hosted.participantPeerIds.filter((id) => id !== senderPeerId)
+    await Promise.allSettled(
+      recipients.map(async (participantPeerId) => {
+        const peer = this.database.getPeer(participantPeerId)
+        if (!peer || peer.status !== 'online') return
+        await this.sendLanMessage(
+          participantPeerId,
+          payload.content,
+          hosted.code,
+          attachment,
+          {
+            persistLocal: false,
+            sessionMessageId: payload.sessionMessageId,
+            senderPeerId,
+            senderName
+          }
+        )
+      })
+    )
   }
 
   getAttachment(attachmentId: string): AttachmentRecord | undefined {
@@ -831,21 +982,28 @@ export class OfflineBackendService {
       size: number
       mime: string
       data: string // base64
-    }
+    },
+    options: SendLanMessageOptions = {}
   ): Promise<ChatMessageRecord> {
     const initialPeer = this.database.getPeer(peerId)
     if (!initialPeer) throw new Error('Peer is not available on the local network.')
 
-    const normalizedSessionCode = sessionCode?.trim().toUpperCase() || null
-    const conversation = this.database.ensureConversation(initialPeer.id, initialPeer.displayName, normalizedSessionCode)
+    const normalizedSessionCode = this.normalizeSessionCode(sessionCode)
+    const persistLocal = options.persistLocal !== false
+    const sessionMessageId = options.sessionMessageId ?? `session-msg-${randomUUID()}`
+    const senderPeerId = options.senderPeerId ?? this.peerId
+    const senderName = options.senderName ?? this.displayName
     const createdAt = Date.now()
     const messageId = `msg-${randomUUID()}`
+    const attachmentId = attachment ? `att-${randomUUID()}` : undefined
 
-    // Save attachment locally first
-    let attachmentRecord: AttachmentRecord | undefined
-    if (attachment) {
-      attachmentRecord = {
-        id: `att-${randomUUID()}`,
+    const conversation = persistLocal
+      ? this.database.ensureConversation(initialPeer.id, initialPeer.displayName, normalizedSessionCode)
+      : null
+
+    if (attachment && conversation && attachmentId) {
+      const attachmentRecord: AttachmentRecord = {
+        id: attachmentId,
         messageId,
         conversationId: conversation.id,
         peerId,
@@ -859,37 +1017,45 @@ export class OfflineBackendService {
       this.database.saveAttachment(attachmentRecord)
     }
 
-    const pendingMessage = this.database.addMessage({
-      id: messageId,
-      conversationId: conversation.id,
-      peerId,
-      peerName: initialPeer.displayName,
-      senderName: this.displayName,
-      recipientName: initialPeer.displayName,
-      content: attachment ? '' : content,
-      direction: 'outgoing',
-      transport: 'wifi',
-      status: 'pending',
-      createdAt,
-      attachmentId: attachmentRecord?.id,
-      attachmentType: attachmentRecord?.type,
-      attachmentName: attachmentRecord?.name,
-      attachmentSize: attachmentRecord?.size,
-      attachmentMime: attachmentRecord?.mime
-    })
+    const pendingMessage = conversation
+      ? this.database.addMessage({
+          id: messageId,
+          conversationId: conversation.id,
+          peerId,
+          peerName: initialPeer.displayName,
+          senderName: senderName,
+          recipientName: initialPeer.displayName,
+          sessionMessageId,
+          content: attachment ? '' : content,
+          direction: 'outgoing',
+          transport: 'wifi',
+          status: 'pending',
+          createdAt,
+          attachmentId,
+          attachmentType: attachment?.type,
+          attachmentName: attachment?.name,
+          attachmentSize: attachment?.size,
+          attachmentMime: attachment?.mime
+        })
+      : null
 
-    this.database.addLedgerRecord({
-      entityType: 'message',
-      entityId: pendingMessage.id,
-      action: 'lan-send',
-      payload: { peerId, contentLength: content.length, hasAttachment: !!attachment }
-    })
+    if (pendingMessage) {
+      this.database.addLedgerRecord({
+        entityType: 'message',
+        entityId: pendingMessage.id,
+        action: 'lan-send',
+        payload: { peerId, contentLength: content.length, hasAttachment: !!attachment }
+      })
+    }
 
     try {
       const buildPayload = (): PeerMessagePayload => ({
         peerId: this.peerId,
         peerName: this.displayName,
+        senderPeerId,
+        senderName,
         recipientName: (this.database.getPeer(peerId)?.displayName ?? initialPeer.displayName),
+        sessionMessageId,
         content: attachment ? '' : content,
         timestamp: createdAt,
         serverPort: this.serverPort,
@@ -897,18 +1063,18 @@ export class OfflineBackendService {
       })
 
       const applyAttachment = (payload: PeerMessagePayload): PeerMessagePayload => {
-        if (!attachmentRecord) return payload
-        payload.attachmentId = attachmentRecord.id
-        payload.attachmentType = attachmentRecord.type
-        payload.attachmentName = attachmentRecord.name
-        payload.attachmentSize = attachmentRecord.size
-        payload.attachmentMime = attachmentRecord.mime
-        payload.attachmentData = attachmentRecord.data
+        if (!attachment || !attachmentId) return payload
+        payload.attachmentId = attachmentId
+        payload.attachmentType = attachment.type
+        payload.attachmentName = attachment.name
+        payload.attachmentSize = attachment.size
+        payload.attachmentMime = attachment.mime
+        payload.attachmentData = attachment.data
         return payload
       }
 
-      const timeoutMs = attachmentRecord
-        ? Math.min(45000, Math.max(15000, Math.ceil(Buffer.byteLength(attachmentRecord.data) / 250000) * 1000))
+      const timeoutMs = attachment
+        ? Math.min(45000, Math.max(15000, Math.ceil(Buffer.byteLength(attachment.data) / 250000) * 1000))
         : 7000
 
       let targetPeer = this.database.getPeer(peerId) ?? initialPeer
@@ -928,10 +1094,38 @@ export class OfflineBackendService {
       }
 
       const deliveredAt = Date.now()
-      this.database.updateMessageStatus(pendingMessage.id, 'delivered', deliveredAt)
-      return { ...pendingMessage, status: 'delivered', deliveredAt }
+      if (pendingMessage) {
+        this.database.updateMessageStatus(pendingMessage.id, 'delivered', deliveredAt)
+        return { ...pendingMessage, status: 'delivered', deliveredAt }
+      }
+
+      return {
+        id: messageId,
+        conversationId: '',
+        peerId,
+        peerName: initialPeer.displayName,
+        senderName,
+        recipientName: initialPeer.displayName,
+        sessionMessageId,
+        content: attachment ? '' : content,
+        direction: 'outgoing',
+        transport: 'wifi',
+        status: 'delivered',
+        createdAt,
+        deliveredAt,
+        hash: '',
+        previousHash: '',
+        attachmentId,
+        attachmentType: attachment?.type,
+        attachmentName: attachment?.name,
+        attachmentSize: attachment?.size,
+        attachmentMime: attachment?.mime,
+        attachmentData: attachment?.data
+      }
     } catch (error) {
-      this.database.updateMessageStatus(pendingMessage.id, 'failed')
+      if (pendingMessage) {
+        this.database.updateMessageStatus(pendingMessage.id, 'failed')
+      }
       const latestPeer = this.database.getPeer(peerId)
       if (latestPeer && this.isReachabilityError(error)) {
         this.database.upsertPeer({ ...latestPeer, status: 'stale', hostedSession: latestPeer.hostedSession ?? null })
@@ -940,28 +1134,53 @@ export class OfflineBackendService {
     }
   }
 
-  receivePeerMessage(
+  async receivePeerMessage(
     payload: PeerMessagePayload,
     remoteAddress?: string | null
-  ): ChatMessageRecord {
+  ): Promise<ChatMessageRecord> {
     this.upsertPeerConnection(payload.peerId, payload.peerName, payload.serverPort, remoteAddress)
-    const peer = this.database.getPeer(payload.peerId) ?? {
-      id: payload.peerId,
-      displayName: payload.peerName,
-      address: this.normalizeRemoteAddress(remoteAddress),
-      port: payload.serverPort,
-      status: 'online' as const,
-      transport: 'wifi' as const,
-      capabilities: ['chat'],
-      lastSeen: Date.now(),
-      hostedSession: null
+    const senderPeerId = payload.senderPeerId ?? payload.peerId
+    const senderName = payload.senderName ?? payload.peerName
+
+    const peer = this.database.getPeer(senderPeerId) ??
+      (senderPeerId === payload.peerId
+        ? {
+            id: payload.peerId,
+            displayName: payload.peerName,
+            address: this.normalizeRemoteAddress(remoteAddress),
+            port: payload.serverPort,
+            status: 'online' as const,
+            transport: 'wifi' as const,
+            capabilities: ['chat'],
+            lastSeen: Date.now(),
+            hostedSession: null
+          }
+        : {
+            id: senderPeerId,
+            displayName: senderName,
+            address: '',
+            port: 0,
+            status: 'online' as const,
+            transport: 'wifi' as const,
+            capabilities: ['chat'],
+            lastSeen: Date.now(),
+            hostedSession: null
+          })
+
+    if (senderPeerId !== payload.peerId && !this.database.getPeer(senderPeerId)) {
+      this.database.upsertPeer(peer)
     }
 
     const conversation = this.database.ensureConversation(
       peer.id,
-      payload.peerName,
+      senderName,
       payload.sessionCode
     )
+    const existing = payload.sessionMessageId
+      ? this.database.findMessageBySessionMessageId(conversation.id, payload.sessionMessageId)
+      : undefined
+    if (existing) return this.hydrateMessage(existing)
+
     const messageId = `msg-${randomUUID()}`
     const now = Date.now()
 
@@ -987,9 +1206,10 @@ export class OfflineBackendService {
       id: messageId,
       conversationId: conversation.id,
       peerId: peer.id,
-      peerName: payload.peerName,
-      senderName: payload.peerName,
+      peerName: senderName,
+      senderName: senderName,
       recipientName: payload.recipientName,
+      sessionMessageId: payload.sessionMessageId,
       content: payload.content,
       direction: 'incoming',
       transport: 'wifi',
@@ -1007,10 +1227,21 @@ export class OfflineBackendService {
       entityType: 'message',
       entityId: message.id,
       action: 'lan-receive',
-      payload: { peerId: payload.peerId, contentLength: payload.content.length }
+      payload: { peerId: senderPeerId, contentLength: payload.content.length }
     })
 
-    return message
+    const hosted = this.database.getHostedSession()
+    const sessionCode = this.normalizeSessionCode(payload.sessionCode)
+    if (
+      hosted &&
+      sessionCode &&
+      hosted.code === sessionCode &&
+      senderPeerId !== this.peerId
+    ) {
+      await this.relaySessionMessage(hosted, payload)
+    }
+
+    return this.hydrateMessage(message)
   }
 
   // ── Participant management ─────────────────────────────────────────────────
